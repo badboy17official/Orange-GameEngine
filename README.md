@@ -69,17 +69,31 @@ third-person-shooter-engine/
 
 ## ⚙️ Build Instructions
 
+### 🐧 Target Platform (Current)
+
+* Primary target OS: **Linux (Arch Linux)**
+* Primary graphics backend: **Vulkan**
+* Current codebase has **no OpenGL** or **DirectX** runtime backend yet.
+* If a Windows backend is added later, target is **DirectX 11** (not DirectX 12).
+
+### 📦 Arch Linux Dependencies
+
+```bash
+sudo pacman -S --needed base-devel cmake ninja vulkan-headers vulkan-icd-loader vulkan-tools
+vulkaninfo --summary
+```
+
 ### 🔧 Release Build
 
 ```bash
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DTPS_ENGINE_REQUIRE_VULKAN=ON
 cmake --build build --parallel
 ```
 
 ### 🧪 Strict Debug Build
 
 ```bash
-cmake -S . -B build-strict -DCMAKE_BUILD_TYPE=Debug -DTPS_ENGINE_WARNINGS_AS_ERRORS=ON
+cmake -S . -B build-strict -DCMAKE_BUILD_TYPE=Debug -DTPS_ENGINE_WARNINGS_AS_ERRORS=ON -DTPS_ENGINE_REQUIRE_VULKAN=ON
 cmake --build build-strict --parallel
 ```
 
@@ -159,8 +173,10 @@ TPS_OVERLAY_EVERY_N_FRAMES=<int>
 ### 🧩 Backend Selection
 
 ```bash
-TPS_RHI_BACKEND=null|vulkan
+TPS_RHI_BACKEND=vulkan|auto|null
 ```
+
+If `TPS_RHI_BACKEND` is unset, runtime now defaults to `vulkan`.
 
 ---
 
@@ -182,7 +198,8 @@ Real-time metrics include:
 
 * Uses **query-pool timestamps** for GPU profiling
 * Currently **headless (no swapchain)** — focused on instrumentation
-* Automatically falls back to `null` backend if Vulkan fails
+* Defaults to Vulkan when no backend env var is provided
+* Automatically falls back to `null` backend if Vulkan init fails
 * GPU timings disabled in fallback mode
 
 ---
@@ -240,7 +257,7 @@ Just **clean, measurable, efficient rendering.**
 
 ## ⚖️ License
 
-Licensed under **GNU GPL v3.0**
+Licensed under the **MIT License**
 See [LICENSE](LICENSE)
 
 ---

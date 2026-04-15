@@ -1,6 +1,7 @@
 #include "engine/rhi/IRhiDevice.h"
 
 #include <cstdlib>
+#include <iostream>
 #include <string_view>
 #include <vector>
 
@@ -56,6 +57,53 @@ private:
 };
 
 #if defined(TPS_HAS_VULKAN)
+const char* vkResultToString(VkResult result) noexcept {
+    switch (result) {
+        case VK_SUCCESS:
+            return "VK_SUCCESS";
+        case VK_NOT_READY:
+            return "VK_NOT_READY";
+        case VK_TIMEOUT:
+            return "VK_TIMEOUT";
+        case VK_EVENT_SET:
+            return "VK_EVENT_SET";
+        case VK_EVENT_RESET:
+            return "VK_EVENT_RESET";
+        case VK_INCOMPLETE:
+            return "VK_INCOMPLETE";
+        case VK_ERROR_OUT_OF_HOST_MEMORY:
+            return "VK_ERROR_OUT_OF_HOST_MEMORY";
+        case VK_ERROR_OUT_OF_DEVICE_MEMORY:
+            return "VK_ERROR_OUT_OF_DEVICE_MEMORY";
+        case VK_ERROR_INITIALIZATION_FAILED:
+            return "VK_ERROR_INITIALIZATION_FAILED";
+        case VK_ERROR_DEVICE_LOST:
+            return "VK_ERROR_DEVICE_LOST";
+        case VK_ERROR_MEMORY_MAP_FAILED:
+            return "VK_ERROR_MEMORY_MAP_FAILED";
+        case VK_ERROR_LAYER_NOT_PRESENT:
+            return "VK_ERROR_LAYER_NOT_PRESENT";
+        case VK_ERROR_EXTENSION_NOT_PRESENT:
+            return "VK_ERROR_EXTENSION_NOT_PRESENT";
+        case VK_ERROR_FEATURE_NOT_PRESENT:
+            return "VK_ERROR_FEATURE_NOT_PRESENT";
+        case VK_ERROR_INCOMPATIBLE_DRIVER:
+            return "VK_ERROR_INCOMPATIBLE_DRIVER";
+        case VK_ERROR_TOO_MANY_OBJECTS:
+            return "VK_ERROR_TOO_MANY_OBJECTS";
+        case VK_ERROR_FORMAT_NOT_SUPPORTED:
+            return "VK_ERROR_FORMAT_NOT_SUPPORTED";
+        case VK_ERROR_FRAGMENTED_POOL:
+            return "VK_ERROR_FRAGMENTED_POOL";
+#if defined(VK_ERROR_UNKNOWN)
+        case VK_ERROR_UNKNOWN:
+            return "VK_ERROR_UNKNOWN";
+#endif
+        default:
+            return "VK_ERROR_UNRECOGNIZED";
+    }
+}
+
 class VulkanRhiDevice final : public IRhiDevice {
 public:
     bool initialize() noexcept override {
@@ -129,6 +177,7 @@ public:
         queue_ = VK_NULL_HANDLE;
         queueFamilyIndex_ = 0;
         timestampPeriodNs_ = 1.0;
+        gpuTimestampsSupported_ = false;
         nextQuery_ = 0;
         frameSubmitted_ = false;
     }
@@ -158,7 +207,9 @@ public:
             return;
         }
 
-        vkCmdResetQueryPool(commandBuffer_, queryPool_, 0U, kMaxTimestampQueries);
+        if (queryPool_ != VK_NULL_HANDLE) {
+            vkCmdResetQueryPool(commandBuffer_, queryPool_, 0U, kMaxTimestampQueries);
+        }
 
         scopes_.clear();
         nextQuery_ = 0;
@@ -195,13 +246,13 @@ public:
     }
 
     bool supportsGpuTimestamps() const noexcept override {
-        return initialized_;
+        return initialized_ && gpuTimestampsSupported_;
     }
 
     GpuTimestampToken beginTimestampScope(const char* label) noexcept override {
         (void)label;
 
-        if (!initialized_ || !frameActive_) {
+        if (!initialized_ || !frameActive_ || !gpuTimestampsSupported_ || queryPool_ == VK_NULL_HANDLE) {
             return GpuTimestampToken{};
         }
 
@@ -228,7 +279,7 @@ public:
     }
 
     void endTimestampScope(GpuTimestampToken token) noexcept override {
-        if (!initialized_ || !frameActive_) {
+        if (!initialized_ || !frameActive_ || !gpuTimestampsSupported_ || queryPool_ == VK_NULL_HANDLE) {
             return;
         }
 
@@ -253,7 +304,7 @@ public:
     bool resolveTimestampScopeMs(GpuTimestampToken token, double& outMs) noexcept override {
         outMs = 0.0;
 
-        if (!initialized_ || token.index >= scopes_.size()) {
+        if (!initialized_ || !gpuTimestampsSupported_ || queryPool_ == VK_NULL_HANDLE || token.index >= scopes_.size()) {
             return false;
         }
 
@@ -303,19 +354,37 @@ private:
         instanceInfo.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
         instanceInfo.pApplicationInfo = &appInfo;
 
-        return vkCreateInstance(&instanceInfo, nullptr, &instance_) == VK_SUCCESS;
+        const VkResult result = vkCreateInstance(&instanceInfo, nullptr, &instance_);
+        if (result != VK_SUCCESS) {
+            std::cerr << "[RHI][Vulkan] vkCreateInstance failed: " << vkResultToString(result) << '\n';
+            return false;
+        }
+
+        return true;
     }
 
     bool pickPhysicalDevice() noexcept {
         std::uint32_t deviceCount = 0;
-        if (vkEnumeratePhysicalDevices(instance_, &deviceCount, nullptr) != VK_SUCCESS || deviceCount == 0U) {
+        const VkResult countResult = vkEnumeratePhysicalDevices(instance_, &deviceCount, nullptr);
+        if (countResult != VK_SUCCESS) {
+            std::cerr << "[RHI][Vulkan] vkEnumeratePhysicalDevices(count) failed: " << vkResultToString(countResult) << '\n';
+            return false;
+        }
+        if (deviceCount == 0U) {
+            std::cerr << "[RHI][Vulkan] No Vulkan physical device found.\n";
             return false;
         }
 
         std::vector<VkPhysicalDevice> devices(deviceCount);
-        if (vkEnumeratePhysicalDevices(instance_, &deviceCount, devices.data()) != VK_SUCCESS) {
+        const VkResult listResult = vkEnumeratePhysicalDevices(instance_, &deviceCount, devices.data());
+        if (listResult != VK_SUCCESS) {
+            std::cerr << "[RHI][Vulkan] vkEnumeratePhysicalDevices(list) failed: " << vkResultToString(listResult) << '\n';
             return false;
         }
+
+        VkPhysicalDevice fallbackDevice = VK_NULL_HANDLE;
+        std::uint32_t fallbackQueueFamilyIndex = 0U;
+        double fallbackTimestampPeriodNs = 1.0;
 
         for (VkPhysicalDevice candidate : devices) {
             std::uint32_t familyCount = 0;
@@ -331,20 +400,39 @@ private:
                 const VkQueueFamilyProperties& props = families[familyIndex];
                 const bool supportsTimestamp = props.timestampValidBits > 0U;
                 const bool supportsQueue = (props.queueFlags & (VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT)) != 0U;
-                if (!supportsTimestamp || !supportsQueue) {
+                if (!supportsQueue) {
                     continue;
                 }
 
                 VkPhysicalDeviceProperties physicalProps{};
                 vkGetPhysicalDeviceProperties(candidate, &physicalProps);
 
-                physicalDevice_ = candidate;
-                queueFamilyIndex_ = familyIndex;
-                timestampPeriodNs_ = static_cast<double>(physicalProps.limits.timestampPeriod);
-                return true;
+                if (supportsTimestamp) {
+                    physicalDevice_ = candidate;
+                    queueFamilyIndex_ = familyIndex;
+                    timestampPeriodNs_ = static_cast<double>(physicalProps.limits.timestampPeriod);
+                    gpuTimestampsSupported_ = true;
+                    return true;
+                }
+
+                if (fallbackDevice == VK_NULL_HANDLE) {
+                    fallbackDevice = candidate;
+                    fallbackQueueFamilyIndex = familyIndex;
+                    fallbackTimestampPeriodNs = static_cast<double>(physicalProps.limits.timestampPeriod);
+                }
             }
         }
 
+        if (fallbackDevice != VK_NULL_HANDLE) {
+            physicalDevice_ = fallbackDevice;
+            queueFamilyIndex_ = fallbackQueueFamilyIndex;
+            timestampPeriodNs_ = fallbackTimestampPeriodNs;
+            gpuTimestampsSupported_ = false;
+            std::cerr << "[RHI][Vulkan] Selected device queue without timestamp support; GPU pass timings disabled.\n";
+            return true;
+        }
+
+        std::cerr << "[RHI][Vulkan] No suitable graphics/compute queue family found.\n";
         return false;
     }
 
@@ -362,11 +450,18 @@ private:
         deviceInfo.queueCreateInfoCount = 1U;
         deviceInfo.pQueueCreateInfos = &queueInfo;
 
-        if (vkCreateDevice(physicalDevice_, &deviceInfo, nullptr, &device_) != VK_SUCCESS) {
+        const VkResult createDeviceResult = vkCreateDevice(physicalDevice_, &deviceInfo, nullptr, &device_);
+        if (createDeviceResult != VK_SUCCESS) {
+            std::cerr << "[RHI][Vulkan] vkCreateDevice failed: " << vkResultToString(createDeviceResult) << '\n';
             return false;
         }
 
         vkGetDeviceQueue(device_, queueFamilyIndex_, 0U, &queue_);
+        if (queue_ == VK_NULL_HANDLE) {
+            std::cerr << "[RHI][Vulkan] vkGetDeviceQueue returned null queue handle.\n";
+            return false;
+        }
+
         return queue_ != VK_NULL_HANDLE;
     }
 
@@ -376,7 +471,9 @@ private:
         poolInfo.queueFamilyIndex = queueFamilyIndex_;
         poolInfo.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
 
-        if (vkCreateCommandPool(device_, &poolInfo, nullptr, &commandPool_) != VK_SUCCESS) {
+        const VkResult commandPoolResult = vkCreateCommandPool(device_, &poolInfo, nullptr, &commandPool_);
+        if (commandPoolResult != VK_SUCCESS) {
+            std::cerr << "[RHI][Vulkan] vkCreateCommandPool failed: " << vkResultToString(commandPoolResult) << '\n';
             return false;
         }
 
@@ -386,7 +483,9 @@ private:
         allocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
         allocInfo.commandBufferCount = 1U;
 
-        if (vkAllocateCommandBuffers(device_, &allocInfo, &commandBuffer_) != VK_SUCCESS) {
+        const VkResult allocateResult = vkAllocateCommandBuffers(device_, &allocInfo, &commandBuffer_);
+        if (allocateResult != VK_SUCCESS) {
+            std::cerr << "[RHI][Vulkan] vkAllocateCommandBuffers failed: " << vkResultToString(allocateResult) << '\n';
             return false;
         }
 
@@ -394,16 +493,33 @@ private:
         fenceInfo.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
         fenceInfo.flags = VK_FENCE_CREATE_SIGNALED_BIT;
 
-        return vkCreateFence(device_, &fenceInfo, nullptr, &frameFence_) == VK_SUCCESS;
+        const VkResult fenceResult = vkCreateFence(device_, &fenceInfo, nullptr, &frameFence_);
+        if (fenceResult != VK_SUCCESS) {
+            std::cerr << "[RHI][Vulkan] vkCreateFence failed: " << vkResultToString(fenceResult) << '\n';
+            return false;
+        }
+
+        return true;
     }
 
     bool createQueryPool() noexcept {
+        if (!gpuTimestampsSupported_) {
+            queryPool_ = VK_NULL_HANDLE;
+            return true;
+        }
+
         VkQueryPoolCreateInfo queryInfo{};
         queryInfo.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
         queryInfo.queryType = VK_QUERY_TYPE_TIMESTAMP;
         queryInfo.queryCount = kMaxTimestampQueries;
 
-        return vkCreateQueryPool(device_, &queryInfo, nullptr, &queryPool_) == VK_SUCCESS;
+        const VkResult queryPoolResult = vkCreateQueryPool(device_, &queryInfo, nullptr, &queryPool_);
+        if (queryPoolResult != VK_SUCCESS) {
+            std::cerr << "[RHI][Vulkan] vkCreateQueryPool failed: " << vkResultToString(queryPoolResult) << '\n';
+            return false;
+        }
+
+        return true;
     }
 
     bool waitForPreviousFrame() noexcept {
@@ -467,6 +583,7 @@ private:
     bool initialized_ = false;
     bool frameActive_ = false;
     bool frameSubmitted_ = false;
+    bool gpuTimestampsSupported_ = false;
 
     VkInstance instance_ = VK_NULL_HANDLE;
     VkPhysicalDevice physicalDevice_ = VK_NULL_HANDLE;
@@ -527,15 +644,19 @@ public:
 
 RhiBackend parseRhiBackend(const char* value) noexcept {
     if (value == nullptr || value[0] == '\0') {
-        return RhiBackend::Null;
-    }
-
-    const std::string_view backend(value);
-    if (backend == "v" || backend == "vk" || backend == "vulkan" || backend == "vulkan_stub") {
         return RhiBackend::VulkanStub;
     }
 
-    return RhiBackend::Null;
+    const std::string_view backend(value);
+    if (backend == "null" || backend == "none") {
+        return RhiBackend::Null;
+    }
+
+    if (backend == "v" || backend == "vk" || backend == "vulkan" || backend == "vulkan_stub" || backend == "auto") {
+        return RhiBackend::VulkanStub;
+    }
+
+    return RhiBackend::VulkanStub;
 }
 }  // namespace
 

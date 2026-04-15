@@ -6,6 +6,7 @@
 #include <cstdlib>
 #include <iomanip>
 #include <iostream>
+#include <string_view>
 
 namespace {
 constexpr std::uint64_t kDepthBytesPerPixel = 4;
@@ -69,10 +70,18 @@ float parseFloatEnv(const char* envName, float fallback) noexcept {
 }  // namespace
 
 void Renderer::initialize() noexcept {
+    const char* backendEnvValue = std::getenv("TPS_RHI_BACKEND");
+    if (backendEnvValue == nullptr || backendEnvValue[0] == '\0') {
+        std::cerr << "[RHI] TPS_RHI_BACKEND not set, defaulting to vulkan.\n";
+    }
+
     rhiDevice_ = createRhiDeviceFromEnvironment();
     if (!rhiDevice_ || !rhiDevice_->initialize()) {
+        std::cerr << "[RHI] Vulkan backend initialization failed, falling back to null backend.\n";
         rhiDevice_ = createRhiDevice(RhiBackend::Null);
         (void)rhiDevice_->initialize();
+    } else if (std::string_view(rhiDevice_->backendName()) == "vulkan_stub") {
+        std::cerr << "[RHI] Vulkan SDK was not linked at build time; running with vulkan_stub (no real GPU timestamps).\n";
     }
 
     config_.enableDepthPrepass = parseBoolEnv("TPS_DEPTH_PREPASS", config_.enableDepthPrepass);

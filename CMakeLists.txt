@@ -14,6 +14,11 @@ endif()
 option(TPS_ENGINE_ENABLE_IPO "Enable interprocedural optimization (LTO)" ON)
 option(TPS_ENGINE_ENABLE_NATIVE_ARCH "Enable -march=native for local builds" OFF)
 option(TPS_ENGINE_WARNINGS_AS_ERRORS "Treat compiler warnings as errors" OFF)
+set(TPS_ENGINE_REQUIRE_VULKAN_DEFAULT OFF)
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    set(TPS_ENGINE_REQUIRE_VULKAN_DEFAULT ON)
+endif()
+option(TPS_ENGINE_REQUIRE_VULKAN "Require Vulkan SDK and fail configure if missing" ${TPS_ENGINE_REQUIRE_VULKAN_DEFAULT})
 
 set(TPS_ENGINE_SOURCES
     main.cpp
@@ -37,6 +42,9 @@ if(Vulkan_FOUND)
     target_link_libraries(third_person_shooter PRIVATE Vulkan::Vulkan)
     target_compile_definitions(third_person_shooter PRIVATE TPS_HAS_VULKAN=1)
 else()
+    if(TPS_ENGINE_REQUIRE_VULKAN)
+        message(FATAL_ERROR "Vulkan SDK not found. Install Vulkan packages (Arch: vulkan-headers vulkan-icd-loader vulkan-tools) or configure with -DTPS_ENGINE_REQUIRE_VULKAN=OFF")
+    endif()
     message(STATUS "Vulkan SDK not found: vulkan backend will use stub mode")
 endif()
 
