@@ -1,51 +1,49 @@
-# Third Person Shooter Engine (TPS Engine-BETA)
+# Third Person Shooter Engine (TPS Engine)
 
 > **A C++ optimization-first game engine built for performance, determinism, and real-world efficiency.**
-> Designed for developers who care about *actual rendering cost*, not just visual tricks.
+> Designed for developers who care about actual rendering cost, not just visual tricks.
 
 ---
 
-## ⚡ What is this?
+## What is this?
 
-TPS Engine is a **performance-driven game engine prototype** written in C++, focused on:
+TPS Engine is a performance-driven game engine written in C++, focused on:
 
-*  Deterministic simulation
-*  Measurable rendering cost
-*  Low-overhead architecture
-*  Efficient GPU/CPU utilization
+* Deterministic simulation
+* Measurable rendering cost
+* Low-overhead architecture
+* Efficient GPU/CPU utilization
 
-This is **not** a "throw hardware at it" engine.
-This is an engine built on the idea that:
-
-> *Good engineering beats brute force.*
+This is not a "throw hardware at it" engine. This engine is built on the idea that good engineering beats brute force.
 
 ---
 
-## 🧬 Core Philosophy
+## Core Philosophy
 
-* Optimize for **real cost per pixel**, not just visuals.
-* Avoid unnecessary **full-screen passes**.
-* Use **depth, stencil, and visibility** to eliminate wasted work.
-* Prefer **compact data formats** over bloated buffers.
-* Make performance **measurable, visible, and controllable**.
-* Design systems that scale by **efficiency**, not hardware brute force.
-
----
-
-## 🛠️ Current Features
-
-* 🔁 Deterministic **60 Hz simulation loop**
-* 👁️ **Culling-driven rendering pipeline**
-* 🔀 Dynamic **Forward+ / Deferred-lite switching**
-* 🌑 **Shadow caster budgeting system**
-* 📊 Real-time **performance overlay**
-* ⏱️ CPU + GPU (Vulkan) **timing instrumentation**
-* 🧩 Modular **RHI abstraction** (`null` + `vulkan`)
-* 📉 Frame budget tracking with **live diagnostics**
+* Optimize for real cost per pixel, not just visuals.
+* Avoid unnecessary full-screen passes.
+* Use depth, stencil, and visibility to eliminate wasted work.
+* Prefer compact data formats over bloated buffers.
+* Make performance measurable, visible, and controllable.
+* Design systems that scale by efficiency, not hardware brute force.
 
 ---
 
-## 🧱 Project Structure
+## Engine Features
+
+* Deterministic 60 Hz simulation loop
+* Culling-driven rendering pipeline (Visibility, Depth Pre-pass, Budgeted Shadows)
+* Dynamic Forward+ / Deferred-lite switching
+* Strict shadow caster budgeting system
+* Real-time performance overlay and instrumentation
+* CPU and GPU (Vulkan) timing metrics with deferred resolution
+* Render Graph architecture (dependency order and hazard validation)
+* Modular RHI abstraction (Vulkan primary, Null fallback)
+* Frame budget tracking with live diagnostics
+
+---
+
+## Project Structure
 
 ```
 third-person-shooter-engine/
@@ -67,30 +65,27 @@ third-person-shooter-engine/
 
 ---
 
-## ⚙️ Build Instructions
+## Build Instructions
 
-### 🐧 Target Platform (Current)
+### Target Platform
 
-* Primary target OS: **Linux (Arch Linux)**
-* Primary graphics backend: **Vulkan**
-* Current codebase has **no OpenGL** or **DirectX** runtime backend yet.
-* If a Windows backend is added later, target is **DirectX 11** (not DirectX 12).
+* Primary OS: Linux (Arch Linux recommended)
+* Graphics backend: Vulkan primary
 
-### 📦 Arch Linux Dependencies
+### Arch Linux Dependencies
 
 ```bash
 sudo pacman -S --needed base-devel cmake ninja vulkan-headers vulkan-icd-loader vulkan-tools
-vulkaninfo --summary
 ```
 
-### 🔧 Release Build
+### Release Build
 
 ```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DTPS_ENGINE_REQUIRE_VULKAN=ON
 cmake --build build --parallel
 ```
 
-### 🧪 Strict Debug Build
+### Strict Debug Build
 
 ```bash
 cmake -S . -B build-strict -DCMAKE_BUILD_TYPE=Debug -DTPS_ENGINE_WARNINGS_AS_ERRORS=ON -DTPS_ENGINE_REQUIRE_VULKAN=ON
@@ -99,7 +94,7 @@ cmake --build build-strict --parallel
 
 ---
 
-## ▶️ Run
+## Run
 
 ```bash
 ./build/third_person_shooter
@@ -107,7 +102,7 @@ cmake --build build-strict --parallel
 
 ---
 
-## 🎮 Controls
+## Controls
 
 | Key     | Action |
 | ------- | ------ |
@@ -117,7 +112,7 @@ cmake --build build-strict --parallel
 
 ---
 
-## 🧠 Rendering Pipeline
+## Rendering Pipeline
 
 ```
 1. visibility
@@ -129,20 +124,20 @@ cmake --build build-strict --parallel
 7. post (optional)
 ```
 
-### 💡 Key Design Choices
+### Key Design Choices
 
-* **Conditional passes only** — no blind full-screen cost
-* **Shadow budgets** instead of unlimited cascades
-* **Dynamic pipeline selection** based on scene pressure
-* **Minimal overdraw philosophy**
+* Conditional passes only; no blind full-screen cost.
+* Strict shadow budgets rather than cascade brute force.
+* Dynamic pipeline selection scaled by scene pressure.
+* Strict "minimal overdraw" rendering philosophy.
 
 ---
 
-## 🎛️ Runtime Configuration
+## Runtime Configuration
 
-All tuning is controlled via **environment variables**.
+All performance tuning and graphics quality nodes are controlled via environment variables.
 
-### 🎚️ Quality Controls
+### Quality Controls
 
 ```bash
 TPS_DEPTH_PREPASS=0|1
@@ -154,7 +149,7 @@ TPS_POST=0|1
 TPS_MSAA=1|2|4|8
 ```
 
-### ⚖️ Performance Budgets
+### Performance Budgets
 
 ```bash
 TPS_CULL_DISTANCE=<float>
@@ -163,20 +158,26 @@ TPS_SHADOW_CASTER_BUDGET=<int>
 TPS_TARGET_FRAME_MS=<float>
 ```
 
-### 📊 Diagnostics
+### Instrumentation & Diagnostics
 
 ```bash
 TPS_OVERLAY=0|1
 TPS_OVERLAY_EVERY_N_FRAMES=<int>
 ```
 
-### 🧩 Backend Selection
+### Backend Selection
 
 ```bash
 TPS_RHI_BACKEND=vulkan|auto|null
 ```
 
-If `TPS_RHI_BACKEND` is unset, runtime now defaults to `vulkan`.
+### Vulkan Debugging
+
+```bash
+TPS_VK_VALIDATION=0|1
+```
+
+If `TPS_VK_VALIDATION` is unset, validation defaults to `ON` in debug builds and `OFF` in release builds.
 
 ---
 
@@ -197,6 +198,7 @@ Real-time metrics include:
 ## 🔬 Vulkan Backend Notes
 
 * Uses **query-pool timestamps** for GPU profiling
+* Uses **non-blocking timestamp resolve** and retries unresolved scopes on later frames
 * Currently **headless (no swapchain)** — focused on instrumentation
 * Defaults to Vulkan when no backend env var is provided
 * Automatically falls back to `null` backend if Vulkan init fails
@@ -224,9 +226,9 @@ TPS_MSAA=2 TPS_SHADOWS=1 TPS_POST=1 TPS_TARGET_FRAME_MS=16.67 ./build/third_pers
 
 * Full GPU rendering backend
 * Real raster output (currently ASCII debug view)
-* Resource barriers & full render graph
+* Full resource-lifetime tracking + barrier synthesis in render graph
 * Asset import + compression pipeline
-* Final GPU timing resolve
+* Multi-frame in-flight command submission path
 
 ---
 

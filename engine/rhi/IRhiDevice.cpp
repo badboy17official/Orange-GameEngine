@@ -1,5 +1,7 @@
 #include "engine/rhi/IRhiDevice.h"
 
+#include <array>
+#include <cctype>
 #include <cstdlib>
 #include <iostream>
 #include <string_view>
@@ -104,6 +106,51 @@ const char* vkResultToString(VkResult result) noexcept {
     }
 }
 
+bool parseBoolEnv(const char* value, bool fallback) noexcept {
+    if (value == nullptr || value[0] == '\0') {
+        return fallback;
+    }
+
+    const char c = static_cast<char>(std::tolower(static_cast<unsigned char>(value[0])));
+    if (c == '0' || c == 'f' || c == 'n') {
+        return false;
+    }
+
+    return true;
+}
+
+bool shouldEnableValidationLayers() noexcept {
+#if defined(NDEBUG)
+    constexpr bool kDebugDefault = false;
+#else
+    constexpr bool kDebugDefault = true;
+#endif
+    return parseBoolEnv(std::getenv("TPS_VK_VALIDATION"), kDebugDefault);
+}
+
+VKAPI_ATTR VkBool32 VKAPI_CALL vkDebugMessageCallback(VkDebugUtilsMessageSeverityFlagBitsEXT messageSeverity,
+                                                      VkDebugUtilsMessageTypeFlagsEXT messageTypes,
+                                                      const VkDebugUtilsMessengerCallbackDataEXT* callbackData,
+                                                      void* userData) {
+    (void)messageTypes;
+    (void)userData;
+
+    const char* severity = "INFO";
+    if ((messageSeverity & VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT) != 0U) {
+        severity = "ERROR";
+    } else if ((messageSeverity & VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT) != 0U) {
+        severity = "WARN";
+    } else if ((messageSeverity & VK_DEBUG_UTILS_MESSAGE_SEVERITY_VERBOSE_BIT_EXT) != 0U) {
+        severity = "VERBOSE";
+    }
+
+    if (callbackData != nullptr && callbackData->pMessage != nullptr) {
+        std::cerr << "[RHI][Vulkan][Validation][" << severity << "] " << callbackData->pMessage << '\n';
+    }
+
+    return VK_FALSE;
+}
+
 class VulkanRhiDevice final : public IRhiDevice {
 public:
     bool initialize() noexcept override {
@@ -134,6 +181,7 @@ public:
             return false;
         }
 
+        currentFrameSerial_ = 0;
         initialized_ = true;
         return true;
     }
@@ -141,7 +189,10 @@ public:
     void shutdown() noexcept override {
         initialized_ = false;
         frameActive_ = false;
+        frameSubmitted_ = false;
+
         scopes_.clear();
+        completedFrames_.clear();
 
         if (device_ != VK_NULL_HANDLE) {
             (void)vkDeviceWaitIdle(device_);
@@ -168,6 +219,8 @@ public:
             device_ = VK_NULL_HANDLE;
         }
 
+        destroyDebugMessenger();
+
         if (instance_ != VK_NULL_HANDLE) {
             vkDestroyInstance(instance_, nullptr);
             instance_ = VK_NULL_HANDLE;
@@ -179,7 +232,8 @@ public:
         timestampPeriodNs_ = 1.0;
         gpuTimestampsSupported_ = false;
         nextQuery_ = 0;
-        frameSubmitted_ = false;
+        currentFrameSerial_ = 0;
+        validationEnabled_ = false;
     }
 
     void beginFrame() noexcept override {
@@ -189,6 +243,11 @@ public:
 
         if (!waitForPreviousFrame()) {
             return;
+        }
+
+        if (frameSubmitted_) {
+            (void)resolveScopes();
+            cacheCompletedFrame();
         }
 
         if (vkResetFences(device_, 1U, &frameFence_) != VK_SUCCESS) {
@@ -215,6 +274,7 @@ public:
         nextQuery_ = 0;
         frameSubmitted_ = false;
         frameActive_ = true;
+        ++currentFrameSerial_;
     }
 
     void endFrame() noexcept override {
@@ -238,7 +298,6 @@ public:
         }
 
         frameSubmitted_ = true;
-        (void)waitForPreviousFrame();
     }
 
     const char* backendName() const noexcept override {
@@ -264,16 +323,13 @@ public:
         scope.beginQuery = nextQuery_;
         scope.endQuery = nextQuery_ + 1U;
 
-        vkCmdWriteTimestamp(
-            commandBuffer_,
-            VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
-            queryPool_,
-            scope.beginQuery);
+        vkCmdWriteTimestamp(commandBuffer_, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, queryPool_, scope.beginQuery);
 
         nextQuery_ += 2U;
         scopes_.push_back(scope);
 
         GpuTimestampToken token{};
+        token.frameSerial = currentFrameSerial_;
         token.index = static_cast<std::uint32_t>(scopes_.size() - 1U);
         return token;
     }
@@ -283,7 +339,7 @@ public:
             return;
         }
 
-        if (token.index >= scopes_.size()) {
+        if (token.frameSerial != currentFrameSerial_ || token.index >= scopes_.size()) {
             return;
         }
 
@@ -292,29 +348,22 @@ public:
             return;
         }
 
-        vkCmdWriteTimestamp(
-            commandBuffer_,
-            VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
-            queryPool_,
-            scope.endQuery);
-
+        vkCmdWriteTimestamp(commandBuffer_, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, queryPool_, scope.endQuery);
         scope.ended = true;
     }
 
     bool resolveTimestampScopeMs(GpuTimestampToken token, double& outMs) noexcept override {
         outMs = 0.0;
 
-        if (!initialized_ || !gpuTimestampsSupported_ || queryPool_ == VK_NULL_HANDLE || token.index >= scopes_.size()) {
+        if (!initialized_ || !gpuTimestampsSupported_ || queryPool_ == VK_NULL_HANDLE || token.index == GpuTimestampToken::kInvalidIndex) {
             return false;
         }
 
-        Scope& scope = scopes_[token.index];
-        if (scope.resolved) {
-            outMs = scope.ms;
+        if (tryResolveFromCompletedFrames(token, outMs)) {
             return true;
         }
 
-        if (!frameSubmitted_) {
+        if (token.frameSerial != currentFrameSerial_ || !frameSubmitted_ || token.index >= scopes_.size()) {
             return false;
         }
 
@@ -322,6 +371,7 @@ public:
             return false;
         }
 
+        const Scope& scope = scopes_[token.index];
         if (!scope.resolved) {
             return false;
         }
@@ -339,9 +389,36 @@ private:
         double ms = 0.0;
     };
 
+    struct CompletedFrame {
+        std::uint32_t frameSerial = 0;
+        std::vector<double> scopeMs;
+        std::vector<bool> scopeResolved;
+    };
+
     static constexpr std::uint32_t kMaxTimestampQueries = 8192U;
+    static constexpr std::size_t kCompletedFrameHistory = 8U;
 
     bool createInstance() noexcept {
+        const bool requestValidation = shouldEnableValidationLayers();
+
+        std::vector<const char*> layers;
+        std::vector<const char*> extensions;
+
+        if (requestValidation) {
+            if (hasInstanceLayer("VK_LAYER_KHRONOS_validation")) {
+                layers.push_back("VK_LAYER_KHRONOS_validation");
+                validationEnabled_ = true;
+
+                if (hasInstanceExtension(VK_EXT_DEBUG_UTILS_EXTENSION_NAME)) {
+                    extensions.push_back(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
+                } else {
+                    std::cerr << "[RHI][Vulkan] Validation requested but VK_EXT_debug_utils is unavailable.\n";
+                }
+            } else {
+                std::cerr << "[RHI][Vulkan] Validation requested but VK_LAYER_KHRONOS_validation is unavailable.\n";
+            }
+        }
+
         VkApplicationInfo appInfo{};
         appInfo.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
         appInfo.pApplicationName = "TPS_Engine";
@@ -353,6 +430,10 @@ private:
         VkInstanceCreateInfo instanceInfo{};
         instanceInfo.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
         instanceInfo.pApplicationInfo = &appInfo;
+        instanceInfo.enabledLayerCount = static_cast<std::uint32_t>(layers.size());
+        instanceInfo.ppEnabledLayerNames = layers.empty() ? nullptr : layers.data();
+        instanceInfo.enabledExtensionCount = static_cast<std::uint32_t>(extensions.size());
+        instanceInfo.ppEnabledExtensionNames = extensions.empty() ? nullptr : extensions.data();
 
         const VkResult result = vkCreateInstance(&instanceInfo, nullptr, &instance_);
         if (result != VK_SUCCESS) {
@@ -360,7 +441,99 @@ private:
             return false;
         }
 
+        if (validationEnabled_ && !extensions.empty() && !createDebugMessenger()) {
+            std::cerr << "[RHI][Vulkan] Validation layer enabled, but debug messenger setup failed.\n";
+        }
+
+        if (validationEnabled_) {
+            std::cerr << "[RHI][Vulkan] Validation enabled (TPS_VK_VALIDATION).\n";
+        }
+
         return true;
+    }
+
+    bool hasInstanceLayer(const char* layerName) const noexcept {
+        std::uint32_t layerCount = 0U;
+        if (vkEnumerateInstanceLayerProperties(&layerCount, nullptr) != VK_SUCCESS || layerCount == 0U) {
+            return false;
+        }
+
+        std::vector<VkLayerProperties> properties(layerCount);
+        if (vkEnumerateInstanceLayerProperties(&layerCount, properties.data()) != VK_SUCCESS) {
+            return false;
+        }
+
+        for (const VkLayerProperties& property : properties) {
+            if (std::string_view(property.layerName) == layerName) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    bool hasInstanceExtension(const char* extensionName) const noexcept {
+        std::uint32_t extensionCount = 0U;
+        if (vkEnumerateInstanceExtensionProperties(nullptr, &extensionCount, nullptr) != VK_SUCCESS || extensionCount == 0U) {
+            return false;
+        }
+
+        std::vector<VkExtensionProperties> properties(extensionCount);
+        if (vkEnumerateInstanceExtensionProperties(nullptr, &extensionCount, properties.data()) != VK_SUCCESS) {
+            return false;
+        }
+
+        for (const VkExtensionProperties& property : properties) {
+            if (std::string_view(property.extensionName) == extensionName) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    bool createDebugMessenger() noexcept {
+        if (instance_ == VK_NULL_HANDLE) {
+            return false;
+        }
+
+        auto createFn = reinterpret_cast<PFN_vkCreateDebugUtilsMessengerEXT>(
+            vkGetInstanceProcAddr(instance_, "vkCreateDebugUtilsMessengerEXT"));
+        if (createFn == nullptr) {
+            return false;
+        }
+
+        VkDebugUtilsMessengerCreateInfoEXT createInfo{};
+        createInfo.sType = VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT;
+        createInfo.messageSeverity =
+            VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT |
+            VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT;
+        createInfo.messageType =
+            VK_DEBUG_UTILS_MESSAGE_TYPE_GENERAL_BIT_EXT |
+            VK_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT |
+            VK_DEBUG_UTILS_MESSAGE_TYPE_PERFORMANCE_BIT_EXT;
+        createInfo.pfnUserCallback = vkDebugMessageCallback;
+
+        const VkResult result = createFn(instance_, &createInfo, nullptr, &debugMessenger_);
+        if (result != VK_SUCCESS) {
+            debugMessenger_ = VK_NULL_HANDLE;
+            return false;
+        }
+
+        return true;
+    }
+
+    void destroyDebugMessenger() noexcept {
+        if (instance_ == VK_NULL_HANDLE || debugMessenger_ == VK_NULL_HANDLE) {
+            return;
+        }
+
+        auto destroyFn = reinterpret_cast<PFN_vkDestroyDebugUtilsMessengerEXT>(
+            vkGetInstanceProcAddr(instance_, "vkDestroyDebugUtilsMessengerEXT"));
+        if (destroyFn != nullptr) {
+            destroyFn(instance_, debugMessenger_, nullptr);
+        }
+        debugMessenger_ = VK_NULL_HANDLE;
     }
 
     bool pickPhysicalDevice() noexcept {
@@ -527,6 +700,10 @@ private:
             return false;
         }
 
+        if (!frameSubmitted_) {
+            return true;
+        }
+
         constexpr std::uint64_t kFenceTimeoutNs = 1'000'000'000ULL;
         const VkResult waitResult = vkWaitForFences(device_, 1U, &frameFence_, VK_TRUE, kFenceTimeoutNs);
         return waitResult == VK_SUCCESS;
@@ -537,36 +714,38 @@ private:
             return true;
         }
 
-        const std::size_t resultCount = static_cast<std::size_t>(nextQuery_);
-        std::vector<std::uint64_t> queryData(resultCount, 0U);
-
-        const VkResult result = vkGetQueryPoolResults(
-            device_,
-            queryPool_,
-            0U,
-            nextQuery_,
-            queryData.size() * sizeof(std::uint64_t),
-            queryData.data(),
-            sizeof(std::uint64_t),
-            VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
-
-        if (result != VK_SUCCESS) {
-            return false;
-        }
-
         for (Scope& scope : scopes_) {
-            if (!scope.ended) {
+            if (!scope.ended || scope.resolved) {
                 continue;
             }
 
-            const std::size_t beginIndex = static_cast<std::size_t>(scope.beginQuery);
-            const std::size_t endIndex = static_cast<std::size_t>(scope.endQuery);
-            if (endIndex >= queryData.size() || beginIndex >= queryData.size()) {
+            const std::array<std::uint64_t, 4> kUnavailable = {0U, 0U, 0U, 0U};
+            std::array<std::uint64_t, 4> data = kUnavailable;
+
+            const VkResult result = vkGetQueryPoolResults(
+                device_,
+                queryPool_,
+                scope.beginQuery,
+                2U,
+                sizeof(data),
+                data.data(),
+                sizeof(std::uint64_t) * 2U,
+                VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WITH_AVAILABILITY_BIT);
+
+            if (result == VK_NOT_READY) {
                 continue;
             }
 
-            const std::uint64_t beginTicks = queryData[beginIndex];
-            const std::uint64_t endTicks = queryData[endIndex];
+            if (result != VK_SUCCESS) {
+                return false;
+            }
+
+            if (data[1] == 0U || data[3] == 0U) {
+                continue;
+            }
+
+            const std::uint64_t beginTicks = data[0];
+            const std::uint64_t endTicks = data[2];
             if (endTicks < beginTicks) {
                 continue;
             }
@@ -580,12 +759,61 @@ private:
         return true;
     }
 
+    void cacheCompletedFrame() noexcept {
+        if (!frameSubmitted_) {
+            return;
+        }
+
+        CompletedFrame frame{};
+        frame.frameSerial = currentFrameSerial_;
+        frame.scopeMs.assign(scopes_.size(), 0.0);
+        frame.scopeResolved.assign(scopes_.size(), false);
+
+        for (std::size_t i = 0; i < scopes_.size(); ++i) {
+            const Scope& scope = scopes_[i];
+            if (!scope.resolved) {
+                continue;
+            }
+            frame.scopeMs[i] = scope.ms;
+            frame.scopeResolved[i] = true;
+        }
+
+        completedFrames_.push_back(std::move(frame));
+        if (completedFrames_.size() > kCompletedFrameHistory) {
+            completedFrames_.erase(completedFrames_.begin());
+        }
+    }
+
+    bool tryResolveFromCompletedFrames(GpuTimestampToken token, double& outMs) const noexcept {
+        for (auto it = completedFrames_.rbegin(); it != completedFrames_.rend(); ++it) {
+            if (it->frameSerial != token.frameSerial) {
+                continue;
+            }
+
+            const std::size_t index = static_cast<std::size_t>(token.index);
+            if (index >= it->scopeResolved.size()) {
+                return false;
+            }
+
+            if (!it->scopeResolved[index]) {
+                return false;
+            }
+
+            outMs = it->scopeMs[index];
+            return true;
+        }
+
+        return false;
+    }
+
     bool initialized_ = false;
     bool frameActive_ = false;
     bool frameSubmitted_ = false;
     bool gpuTimestampsSupported_ = false;
+    bool validationEnabled_ = false;
 
     VkInstance instance_ = VK_NULL_HANDLE;
+    VkDebugUtilsMessengerEXT debugMessenger_ = VK_NULL_HANDLE;
     VkPhysicalDevice physicalDevice_ = VK_NULL_HANDLE;
     VkDevice device_ = VK_NULL_HANDLE;
     VkQueue queue_ = VK_NULL_HANDLE;
@@ -599,7 +827,9 @@ private:
     double timestampPeriodNs_ = 1.0;
 
     std::vector<Scope> scopes_;
+    std::vector<CompletedFrame> completedFrames_;
     std::uint32_t nextQuery_ = 0;
+    std::uint32_t currentFrameSerial_ = 0;
 };
 #else
 class VulkanRhiDevice final : public IRhiDevice {

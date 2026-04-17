@@ -25,6 +25,7 @@ set(TPS_ENGINE_SOURCES
     engine/core/Engine.cpp
     engine/core/Profiler.cpp
     engine/graphics/Renderer.cpp
+    engine/graphics/RenderGraph.cpp
     engine/rhi/IRhiDevice.cpp
     engine/input/InputManager.cpp
     engine/physics/Physics.cpp

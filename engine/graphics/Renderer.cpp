@@ -99,6 +99,11 @@ void Renderer::initialize() noexcept {
         static_cast<std::uint8_t>(parseUInt16Env("TPS_OVERLAY_EVERY_N_FRAMES", config_.overlayEveryNFrames, 1U, 60U));
     config_.targetFrameMs = parseFloatEnv("TPS_TARGET_FRAME_MS", config_.targetFrameMs);
 
+    renderGraphReady_ = false;
+    renderGraphErrorLogged_ = false;
+    pendingGpuPasses_.clear();
+    lastResolvedGpuMs_.clear();
+
     frameCount_ = 0;
     terminalPrintCounter_ = 0;
 
@@ -146,13 +151,25 @@ void Renderer::submitEnemy(const Vec3& position, std::uint16_t health) noexcept 
 }
 
 void Renderer::render() noexcept {
-    runPass("visibility", true, [this](PassCost& pass) { passVisibility(pass); });
-    runPass("depth_prepass", config_.enableDepthPrepass, [this](PassCost& pass) { passDepthPrepass(pass); });
-    runPass("shadow", config_.enableShadowPass, [this](PassCost& pass) { passShadow(pass); });
-    runPass("lighting", true, [this](PassCost& pass) { passLighting(pass); });
-    runPass("volumetric_fog", config_.enableVolumetricFog, [this](PassCost& pass) { passFog(pass); });
-    runPass("transparent", true, [this](PassCost& pass) { passTransparent(pass); });
-    runPass("post", config_.enablePost, [this](PassCost& pass) { passPost(pass); });
+    if (!renderGraphReady_) {
+        renderGraphReady_ = buildRenderGraph();
+    }
+
+    if (!renderGraphReady_) {
+        runPass("visibility", true, [this](PassCost& pass) { passVisibility(pass); });
+        runPass("depth_prepass", config_.enableDepthPrepass, [this](PassCost& pass) { passDepthPrepass(pass); });
+        runPass("shadow", config_.enableShadowPass, [this](PassCost& pass) { passShadow(pass); });
+        runPass("lighting", true, [this](PassCost& pass) { passLighting(pass); });
+        runPass("volumetric_fog", config_.enableVolumetricFog, [this](PassCost& pass) { passFog(pass); });
+        runPass("transparent", true, [this](PassCost& pass) { passTransparent(pass); });
+        runPass("post", config_.enablePost, [this](PassCost& pass) { passPost(pass); });
+        drawAsciiFrame();
+        return;
+    }
+
+    for (std::size_t nodeIndex : renderGraph_.executionOrder()) {
+        executeRenderGraphPass(nodeIndex);
+    }
 
     drawAsciiFrame();
 }
@@ -179,6 +196,10 @@ void Renderer::cleanup() noexcept {
     visibleEnemyIndices_.clear();
     shadowCasterIndices_.clear();
     frameBuffer_.clear();
+    pendingGpuPasses_.clear();
+    lastResolvedGpuMs_.clear();
+    renderGraphReady_ = false;
+    renderGraphErrorLogged_ = false;
     resetDiagnostics();
 }
 
@@ -188,6 +209,112 @@ std::size_t Renderer::frameCount() const noexcept {
 
 const FrameDiagnostics& Renderer::lastFrameDiagnostics() const noexcept {
     return diagnostics_;
+}
+
+bool Renderer::buildRenderGraph() noexcept {
+    std::vector<RenderPassNodeDesc> nodes;
+    nodes.reserve(7);
+
+    nodes.push_back(RenderPassNodeDesc{
+        "visibility",
+        true,
+        {},
+        {RenderResourceUsage{"enemy_instances", RenderResourceAccess::Read},
+         RenderResourceUsage{"visible_list", RenderResourceAccess::Write}}});
+    nodes.push_back(RenderPassNodeDesc{
+        "depth_prepass",
+        config_.enableDepthPrepass,
+        {"visibility"},
+        {RenderResourceUsage{"visible_list", RenderResourceAccess::Read},
+         RenderResourceUsage{"depth", RenderResourceAccess::Write}}});
+    nodes.push_back(RenderPassNodeDesc{
+        "shadow",
+        config_.enableShadowPass,
+        {"visibility"},
+        {RenderResourceUsage{"visible_list", RenderResourceAccess::Read},
+         RenderResourceUsage{"shadow_map", RenderResourceAccess::Write}}});
+    nodes.push_back(RenderPassNodeDesc{
+        "lighting",
+        true,
+        {"visibility", "depth_prepass", "shadow"},
+        {RenderResourceUsage{"visible_list", RenderResourceAccess::Read},
+         RenderResourceUsage{"depth", RenderResourceAccess::Read},
+         RenderResourceUsage{"shadow_map", RenderResourceAccess::Read},
+         RenderResourceUsage{"hdr_color", RenderResourceAccess::Write}}});
+    nodes.push_back(RenderPassNodeDesc{
+        "volumetric_fog",
+        config_.enableVolumetricFog,
+        {"lighting"},
+        {RenderResourceUsage{"depth", RenderResourceAccess::Read},
+         RenderResourceUsage{"hdr_color", RenderResourceAccess::ReadWrite}}});
+    nodes.push_back(RenderPassNodeDesc{
+        "transparent",
+        true,
+        {"lighting"},
+        {RenderResourceUsage{"depth", RenderResourceAccess::Read},
+         RenderResourceUsage{"hdr_color", RenderResourceAccess::ReadWrite}}});
+    nodes.push_back(RenderPassNodeDesc{
+        "post",
+        config_.enablePost,
+        {"transparent", "volumetric_fog"},
+        {RenderResourceUsage{"hdr_color", RenderResourceAccess::Read},
+         RenderResourceUsage{"backbuffer", RenderResourceAccess::Write}}});
+
+    if (!renderGraph_.build(std::move(nodes))) {
+        if (!renderGraphErrorLogged_) {
+            std::cerr << "[Renderer] Render graph disabled: " << renderGraph_.lastError() << '\n';
+            renderGraphErrorLogged_ = true;
+        }
+        return false;
+    }
+
+    return true;
+}
+
+void Renderer::executeRenderGraphPass(std::size_t nodeIndex) noexcept {
+    if (nodeIndex >= renderGraph_.nodes().size()) {
+        return;
+    }
+
+    const RenderPassNodeDesc& node = renderGraph_.nodes()[nodeIndex];
+    const std::string_view name = node.name != nullptr ? std::string_view(node.name) : std::string_view{};
+    if (name.empty()) {
+        return;
+    }
+
+    if (name == "visibility") {
+        runPass("visibility", true, [this](PassCost& pass) { passVisibility(pass); });
+        return;
+    }
+
+    if (name == "depth_prepass") {
+        runPass("depth_prepass", config_.enableDepthPrepass, [this](PassCost& pass) { passDepthPrepass(pass); });
+        return;
+    }
+
+    if (name == "shadow") {
+        runPass("shadow", config_.enableShadowPass, [this](PassCost& pass) { passShadow(pass); });
+        return;
+    }
+
+    if (name == "lighting") {
+        runPass("lighting", true, [this](PassCost& pass) { passLighting(pass); });
+        return;
+    }
+
+    if (name == "volumetric_fog") {
+        runPass("volumetric_fog", config_.enableVolumetricFog, [this](PassCost& pass) { passFog(pass); });
+        return;
+    }
+
+    if (name == "transparent") {
+        runPass("transparent", true, [this](PassCost& pass) { passTransparent(pass); });
+        return;
+    }
+
+    if (name == "post") {
+        runPass("post", config_.enablePost, [this](PassCost& pass) { passPost(pass); });
+    }
 }
 
 template <typename Fn>
@@ -405,21 +532,60 @@ void Renderer::drawAsciiFrame() noexcept {
 }
 
 void Renderer::resolveGpuPassTimes() noexcept {
+    constexpr std::size_t kPendingGpuFramesTtl = 32U;
+
     if (!rhiDevice_ || !rhiDevice_->supportsGpuTimestamps()) {
+        pendingGpuPasses_.clear();
         return;
     }
 
+    std::size_t pendingWrite = 0U;
+    for (std::size_t i = 0; i < pendingGpuPasses_.size(); ++i) {
+        PendingGpuPass& pending = pendingGpuPasses_[i];
+        double resolvedMs = 0.0;
+        const bool resolved = rhiDevice_->resolveTimestampScopeMs(pending.token, resolvedMs);
+        const bool expired = (frameCount_ - pending.enqueuedFrame) > kPendingGpuFramesTtl;
+
+        if (resolved) {
+            lastResolvedGpuMs_[pending.passName] = resolvedMs;
+            continue;
+        }
+
+        if (expired) {
+            continue;
+        }
+
+        if (pendingWrite != i) {
+            pendingGpuPasses_[pendingWrite] = pendingGpuPasses_[i];
+        }
+        ++pendingWrite;
+    }
+    pendingGpuPasses_.resize(pendingWrite);
+
     for (std::size_t i = 0; i < diagnostics_.passCount; ++i) {
         PassCost& pass = diagnostics_.passes[i];
-        if (!pass.executed) {
+        if (!pass.executed || pass.gpuToken.index == GpuTimestampToken::kInvalidIndex) {
             continue;
         }
 
-        if (pass.gpuToken.index == GpuTimestampToken::kInvalidIndex) {
+        double resolvedMs = 0.0;
+        const bool resolved = rhiDevice_->resolveTimestampScopeMs(pass.gpuToken, resolvedMs);
+        if (resolved) {
+            pass.hasGpuTimestamp = true;
+            pass.gpuTimestampStale = false;
+            pass.gpuMs = resolvedMs;
+            lastResolvedGpuMs_[pass.name] = resolvedMs;
             continue;
         }
 
-        pass.hasGpuTimestamp = rhiDevice_->resolveTimestampScopeMs(pass.gpuToken, pass.gpuMs);
+        pendingGpuPasses_.push_back(PendingGpuPass{std::string(pass.name), pass.gpuToken, frameCount_});
+
+        const auto cached = lastResolvedGpuMs_.find(pass.name);
+        if (cached != lastResolvedGpuMs_.end()) {
+            pass.hasGpuTimestamp = true;
+            pass.gpuTimestampStale = true;
+            pass.gpuMs = cached->second;
+        }
     }
 }
 
@@ -475,6 +641,9 @@ void Renderer::printDiagnosticsOverlay() noexcept {
         std::cout << "  pass " << pass.name << " cpu_ms=" << pass.cpuMs;
         if (pass.hasGpuTimestamp) {
             std::cout << " gpu_ms=" << pass.gpuMs;
+            if (pass.gpuTimestampStale) {
+                std::cout << "(stale)";
+            }
         }
         std::cout << " work=" << pass.workItems << " est_bytes=" << pass.estimatedBytes << "\n";
     }

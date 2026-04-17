@@ -6,9 +6,11 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "engine/core/Math.h"
+#include "engine/graphics/RenderGraph.h"
 #include "engine/rhi/IRhiDevice.h"
 
 struct RendererConfig {
@@ -41,6 +43,7 @@ struct PassCost {
     std::uint64_t estimatedBytes = 0;
     bool executed = false;
     bool hasGpuTimestamp = false;
+    bool gpuTimestampStale = false;
 };
 
 struct FrameDiagnostics {
@@ -110,6 +113,8 @@ private:
     void passTransparent(PassCost& pass) noexcept;
     void passPost(PassCost& pass) noexcept;
 
+    bool buildRenderGraph() noexcept;
+    void executeRenderGraphPass(std::size_t nodeIndex) noexcept;
     void drawAsciiFrame() noexcept;
     void resolveGpuPassTimes() noexcept;
     void printDiagnosticsOverlay() noexcept;
@@ -123,7 +128,19 @@ private:
     std::vector<std::uint32_t> shadowCasterIndices_;
 
     FrameDiagnostics diagnostics_{};
+    RenderGraph renderGraph_{};
     std::unique_ptr<IRhiDevice> rhiDevice_;
+
+    struct PendingGpuPass {
+        std::string passName;
+        GpuTimestampToken token{};
+        std::size_t enqueuedFrame = 0;
+    };
+
+    std::vector<PendingGpuPass> pendingGpuPasses_;
+    std::unordered_map<std::string, double> lastResolvedGpuMs_;
+    bool renderGraphReady_ = false;
+    bool renderGraphErrorLogged_ = false;
 
     std::size_t frameCount_ = 0;
     std::size_t terminalPrintCounter_ = 0;

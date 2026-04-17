@@ -5,6 +5,7 @@
 
 struct GpuTimestampToken {
     static constexpr std::uint32_t kInvalidIndex = 0xFFFFFFFFu;
+    std::uint32_t frameSerial = 0;
     std::uint32_t index = kInvalidIndex;
 };
 
